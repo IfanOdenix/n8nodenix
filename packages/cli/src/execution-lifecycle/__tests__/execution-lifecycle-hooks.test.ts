@@ -1,13 +1,16 @@
-import { stringify } from 'flatted';
+import { Logger } from '@n8n/backend-common';
+import { mockInstance } from '@n8n/backend-test-utils';
+import type { Project } from '@n8n/db';
+import { ExecutionRepository } from '@n8n/db';
 import { mock } from 'jest-mock-extended';
 import {
 	BinaryDataService,
 	ErrorReporter,
 	InstanceSettings,
-	Logger,
 	ExecutionLifecycleHooks,
+	BinaryDataConfig,
 } from 'n8n-core';
-import { ExpressionError } from 'n8n-workflow';
+import { createRunExecutionData, ExpressionError } from 'n8n-workflow';
 import type {
 	IRunExecutionData,
 	ITaskData,
@@ -17,19 +20,17 @@ import type {
 	INode,
 	IWorkflowBase,
 	WorkflowExecuteMode,
+	ITaskStartedData,
 } from 'n8n-workflow';
 
-import config from '@/config';
-import type { Project } from '@/databases/entities/project';
-import { ExecutionRepository } from '@/databases/repositories/execution.repository';
 import { EventService } from '@/events/event.service';
 import { ExternalHooks } from '@/external-hooks';
 import { Push } from '@/push';
+import { ExecutionMetadataService } from '@/services/execution-metadata.service';
 import { OwnershipService } from '@/services/ownership.service';
 import { WorkflowStatisticsService } from '@/services/workflow-statistics.service';
 import { WorkflowExecutionService } from '@/workflows/workflow-execution.service';
 import { WorkflowStaticDataService } from '@/workflows/workflow-static-data.service';
-import { mockInstance } from '@test/mocking';
 
 import {
 	getLifecycleHooksForSubExecutions,
@@ -44,6 +45,7 @@ describe('Execution Lifecycle Hooks', () => {
 	const errorReporter = mockInstance(ErrorReporter);
 	const eventService = mockInstance(EventService);
 	const executionRepository = mockInstance(ExecutionRepository);
+	const executionMetadataService = mockInstance(ExecutionMetadataService);
 	const externalHooks = mockInstance(ExternalHooks);
 	const push = mockInstance(Push);
 	const workflowStaticDataService = mockInstance(WorkflowStaticDataService);
@@ -53,6 +55,8 @@ describe('Execution Lifecycle Hooks', () => {
 	const workflowExecutionService = mockInstance(WorkflowExecutionService);
 
 	const nodeName = 'Test Node';
+	const nodeType = 'n8n-nodes-base.testNode';
+	const nodeId = 'test-node-id';
 	const node = mock<INode>();
 	const workflowId = 'test-workflow-id';
 	const executionId = 'test-execution-id';
@@ -60,16 +64,34 @@ describe('Execution Lifecycle Hooks', () => {
 		id: workflowId,
 		name: 'Test Workflow',
 		active: true,
+		activeVersionId: 'some-version-id',
+		isArchived: false,
 		connections: {},
-		nodes: [],
+		nodes: [
+			{
+				id: nodeId,
+				name: nodeName,
+				type: nodeType,
+				typeVersion: 1,
+				position: [100, 200],
+				parameters: {},
+			},
+		],
 		settings: {},
 		createdAt: new Date(),
 		updatedAt: new Date(),
 	};
 	const workflow = mock<Workflow>();
 	const staticData = mock<IDataObject>();
+	const taskStartedData = mock<ITaskStartedData>();
 	const taskData = mock<ITaskData>();
 	const runExecutionData = mock<IRunExecutionData>();
+
+	const successfulRunWithRewiredDestination = mock<IRun>({
+		status: 'success',
+		finished: true,
+		waitTill: undefined,
+	});
 	const successfulRun = mock<IRun>({
 		status: 'success',
 		finished: true,
@@ -85,9 +107,23 @@ describe('Execution Lifecycle Hooks', () => {
 		status: 'waiting',
 		waitTill: new Date(),
 	});
+	const successfulRunWithMetadata = mock<IRun>({
+		status: 'success',
+		finished: true,
+		waitTill: undefined,
+		data: {
+			resultData: {
+				metadata: {
+					testKey1: 'testValue1',
+					testKey2: 'testValue2',
+				},
+			},
+		},
+	});
 	const expressionError = new ExpressionError('Error');
 	const pushRef = 'test-push-ref';
 	const retryOf = 'test-retry-of';
+	const userId = 'test-user-id';
 
 	const now = new Date('2025-01-13T18:25:50.267Z');
 	jest.useFakeTimers({ now });
@@ -97,20 +133,38 @@ describe('Execution Lifecycle Hooks', () => {
 	beforeEach(() => {
 		jest.clearAllMocks();
 		workflowData.settings = {};
-		successfulRun.data = {
+		successfulRun.data = createRunExecutionData({
 			resultData: {
 				runData: {},
 			},
-		};
-		failedRun.data = {
+		});
+		failedRun.data = createRunExecutionData({
 			resultData: {
 				runData: {},
 				error: expressionError,
 			},
-		};
+		});
+		successfulRunWithRewiredDestination.data = createRunExecutionData({
+			startData: {
+				destinationNode: { nodeName: 'PartialExecutionToolExecutor', mode: 'inclusive' },
+				originalDestinationNode: { nodeName, mode: 'inclusive' },
+			},
+			resultData: {
+				runData: {},
+			},
+		});
+		successfulRunWithMetadata.data = createRunExecutionData({
+			resultData: {
+				runData: {},
+				metadata: {
+					testKey1: 'testValue1',
+					testKey2: 'testValue2',
+				},
+			},
+		});
 	});
 
-	const workflowEventTests = () => {
+	const workflowEventTests = (expectedUserId?: string) => {
 		describe('workflowExecuteBefore', () => {
 			it('should emit workflow-pre-execute events', async () => {
 				await lifecycleHooks.runHook('workflowExecuteBefore', [workflow, runExecutionData]);
@@ -130,6 +184,7 @@ describe('Execution Lifecycle Hooks', () => {
 					executionId,
 					runData: successfulRun,
 					workflow: workflowData,
+					userId: expectedUserId,
 				});
 			});
 
@@ -138,18 +193,42 @@ describe('Execution Lifecycle Hooks', () => {
 
 				expect(eventService.emit).not.toHaveBeenCalledWith('workflow-post-execute');
 			});
+
+			it('should reset destination node to original destination', async () => {
+				await lifecycleHooks.runHook('workflowExecuteAfter', [
+					successfulRunWithRewiredDestination,
+					{},
+				]);
+
+				expect(eventService.emit).toHaveBeenCalledWith('workflow-post-execute', {
+					executionId,
+					runData: successfulRunWithRewiredDestination,
+					workflow: workflowData,
+					userId: expectedUserId,
+				});
+
+				expect(successfulRunWithRewiredDestination.data.startData?.destinationNode).toEqual({
+					nodeName,
+					mode: 'inclusive',
+				});
+				expect(
+					successfulRunWithRewiredDestination.data.startData?.originalDestinationNode,
+				).toBeUndefined();
+			});
 		});
 	};
 
 	const nodeEventsTests = () => {
 		describe('nodeExecuteBefore', () => {
 			it('should emit node-pre-execute event', async () => {
-				await lifecycleHooks.runHook('nodeExecuteBefore', [nodeName]);
+				await lifecycleHooks.runHook('nodeExecuteBefore', [nodeName, taskStartedData]);
 
 				expect(eventService.emit).toHaveBeenCalledWith('node-pre-execute', {
 					executionId,
 					workflow: workflowData,
 					nodeName,
+					nodeType,
+					nodeId,
 				});
 			});
 		});
@@ -162,6 +241,8 @@ describe('Execution Lifecycle Hooks', () => {
 					executionId,
 					workflow: workflowData,
 					nodeName,
+					nodeType,
+					nodeId,
 				});
 			});
 		});
@@ -214,7 +295,7 @@ describe('Execution Lifecycle Hooks', () => {
 	describe('getLifecycleHooksForRegularMain', () => {
 		const createHooks = (executionMode: WorkflowExecuteMode = 'manual') =>
 			getLifecycleHooksForRegularMain(
-				{ executionMode, workflowData, pushRef, retryOf },
+				{ executionMode, workflowData, pushRef, retryOf, userId },
 				executionId,
 			);
 
@@ -222,7 +303,7 @@ describe('Execution Lifecycle Hooks', () => {
 			lifecycleHooks = createHooks();
 		});
 
-		workflowEventTests();
+		workflowEventTests(userId);
 		nodeEventsTests();
 		externalHooksTests();
 		statisticsTests();
@@ -240,26 +321,84 @@ describe('Execution Lifecycle Hooks', () => {
 			expect(handlers.workflowExecuteAfter).toHaveLength(5);
 			expect(handlers.nodeFetchedData).toHaveLength(1);
 			expect(handlers.sendResponse).toHaveLength(0);
+			expect(handlers.sendChunk).toHaveLength(0);
 		});
 
 		describe('nodeExecuteBefore', () => {
 			it('should send nodeExecuteBefore push event', async () => {
-				await lifecycleHooks.runHook('nodeExecuteBefore', [nodeName]);
+				await lifecycleHooks.runHook('nodeExecuteBefore', [nodeName, taskStartedData]);
 
 				expect(push.send).toHaveBeenCalledWith(
-					{ type: 'nodeExecuteBefore', data: { executionId, nodeName } },
+					{ type: 'nodeExecuteBefore', data: { executionId, nodeName, data: taskStartedData } },
 					pushRef,
 				);
 			});
 		});
 
 		describe('nodeExecuteAfter', () => {
-			it('should send nodeExecuteAfter push event', async () => {
-				await lifecycleHooks.runHook('nodeExecuteAfter', [nodeName, taskData, runExecutionData]);
+			it('should send nodeExecuteAfter and nodeExecuteAfterData push events', async () => {
+				const mockTaskData: ITaskData = {
+					startTime: 1,
+					executionTime: 1,
+					executionIndex: 0,
+					source: [],
+					data: {
+						main: [
+							[
+								{
+									json: { key: 'value' },
+									binary: {
+										data: {
+											id: '123',
+											data: '',
+											mimeType: 'text/plain',
+										},
+									},
+								},
+							],
+						],
+					},
+				};
 
-				expect(push.send).toHaveBeenCalledWith(
-					{ type: 'nodeExecuteAfter', data: { executionId, nodeName, data: taskData } },
+				await lifecycleHooks.runHook('nodeExecuteAfter', [
+					nodeName,
+					mockTaskData,
+					runExecutionData,
+				]);
+
+				const { data: _, ...taskDataWithoutData } = mockTaskData;
+
+				expect(push.send).toHaveBeenNthCalledWith(
+					1,
+					{
+						type: 'nodeExecuteAfter',
+						data: {
+							executionId,
+							nodeName,
+							itemCountByConnectionType: {
+								main: [1],
+							},
+							data: taskDataWithoutData,
+						},
+					},
 					pushRef,
+				);
+
+				expect(push.send).toHaveBeenNthCalledWith(
+					2,
+					{
+						type: 'nodeExecuteAfterData',
+						data: {
+							executionId,
+							nodeName,
+							itemCountByConnectionType: {
+								main: [1],
+							},
+							data: mockTaskData,
+						},
+					},
+					pushRef,
+					true,
 				);
 			});
 
@@ -325,7 +464,6 @@ describe('Execution Lifecycle Hooks', () => {
 						type: 'executionFinished',
 						data: {
 							executionId,
-							rawData: stringify(successfulRun.data),
 							status: 'success',
 							workflowId: 'test-workflow-id',
 						},
@@ -422,6 +560,38 @@ describe('Execution Lifecycle Hooks', () => {
 				});
 			});
 
+			describe('saving metadata', () => {
+				it('should save metadata in regular main mode', async () => {
+					await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRunWithMetadata, {}]);
+
+					expect(executionMetadataService.save).toHaveBeenCalledWith(executionId, {
+						testKey1: 'testValue1',
+						testKey2: 'testValue2',
+					});
+				});
+
+				it('should not save metadata if execution has none', async () => {
+					await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRun, {}]);
+
+					expect(executionMetadataService.save).not.toHaveBeenCalled();
+				});
+
+				it('should save metadata even if execution will be kept (not deleted)', async () => {
+					lifecycleHooks = createHooks('trigger');
+					workflowData.settings = {
+						saveDataSuccessExecution: 'all',
+					};
+
+					await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRunWithMetadata, {}]);
+
+					expect(executionMetadataService.save).toHaveBeenCalledWith(executionId, {
+						testKey1: 'testValue1',
+						testKey2: 'testValue2',
+					});
+					expect(executionRepository.hardDelete).not.toHaveBeenCalled();
+				});
+			});
+
 			describe('error workflow', () => {
 				it('should not execute error workflow for manual executions', async () => {
 					await lifecycleHooks.runHook('workflowExecuteAfter', [failedRun, {}]);
@@ -463,14 +633,15 @@ describe('Execution Lifecycle Hooks', () => {
 			});
 
 			it('should restore binary data IDs after workflow execution for webhooks', async () => {
-				config.set('binaryDataManager.mode', 'filesystem');
+				mockInstance(BinaryDataConfig, { mode: 'filesystem' });
 				lifecycleHooks = createHooks('webhook');
 
 				(successfulRun.data.resultData.runData = {
 					[nodeName]: [
 						{
-							executionTime: 1,
 							startTime: 1,
+							executionIndex: 0,
+							executionTime: 1,
 							source: [],
 							data: {
 								main: [
@@ -515,7 +686,7 @@ describe('Execution Lifecycle Hooks', () => {
 				expect(handlers.workflowExecuteBefore).toHaveLength(2);
 				expect(handlers.workflowExecuteAfter).toHaveLength(4);
 
-				await lifecycleHooks.runHook('nodeExecuteBefore', [nodeName]);
+				await lifecycleHooks.runHook('nodeExecuteBefore', [nodeName, taskStartedData]);
 				await lifecycleHooks.runHook('nodeExecuteAfter', [nodeName, taskData, runExecutionData]);
 				await lifecycleHooks.runHook('workflowExecuteBefore', [workflow, runExecutionData]);
 				await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRun, {}]);
@@ -527,13 +698,19 @@ describe('Execution Lifecycle Hooks', () => {
 
 	describe('getLifecycleHooksForScalingMain', () => {
 		beforeEach(() => {
-			lifecycleHooks = getLifecycleHooksForScalingMain('manual', executionId, workflowData, {
-				pushRef,
-				retryOf,
-			});
+			lifecycleHooks = getLifecycleHooksForScalingMain(
+				{
+					executionMode: 'manual',
+					workflowData,
+					pushRef,
+					retryOf,
+					userId,
+				},
+				executionId,
+			);
 		});
 
-		workflowEventTests();
+		workflowEventTests(userId);
 		externalHooksTests();
 
 		it('should setup the correct set of hooks', () => {
@@ -549,6 +726,7 @@ describe('Execution Lifecycle Hooks', () => {
 			expect(handlers.workflowExecuteAfter).toHaveLength(4);
 			expect(handlers.nodeFetchedData).toHaveLength(0);
 			expect(handlers.sendResponse).toHaveLength(0);
+			expect(handlers.sendChunk).toHaveLength(0);
 		});
 
 		describe('workflowExecuteBefore', () => {
@@ -566,13 +744,13 @@ describe('Execution Lifecycle Hooks', () => {
 					saveDataErrorExecution: 'all',
 				};
 				const lifecycleHooks = getLifecycleHooksForScalingMain(
-					'webhook',
-					executionId,
-					workflowData,
 					{
+						executionMode: 'webhook',
+						workflowData,
 						pushRef,
 						retryOf,
 					},
+					executionId,
 				);
 
 				await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRun, {}]);
@@ -589,13 +767,13 @@ describe('Execution Lifecycle Hooks', () => {
 					saveDataErrorExecution: 'none',
 				};
 				const lifecycleHooks = getLifecycleHooksForScalingMain(
-					'webhook',
-					executionId,
-					workflowData,
 					{
+						executionMode: 'webhook',
+						workflowData,
 						pushRef,
 						retryOf,
 					},
+					executionId,
 				);
 
 				await lifecycleHooks.runHook('workflowExecuteAfter', [failedRun, {}]);
@@ -605,15 +783,59 @@ describe('Execution Lifecycle Hooks', () => {
 					executionId,
 				});
 			});
+
+			describe('metadata handling', () => {
+				it('should save metadata in scaling main mode when execution is kept', async () => {
+					// Test that scaling main saves metadata when execution is not deleted
+					await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRunWithMetadata, {}]);
+
+					expect(executionMetadataService.save).toHaveBeenCalledWith(executionId, {
+						testKey1: 'testValue1',
+						testKey2: 'testValue2',
+					});
+				});
+
+				it('should NOT save metadata in scaling main mode when execution is deleted', async () => {
+					workflowData.settings = {
+						saveDataSuccessExecution: 'none' as const,
+						saveDataErrorExecution: 'all' as const,
+					};
+					const testLifecycleHooks = getLifecycleHooksForScalingMain(
+						{
+							executionMode: 'webhook',
+							workflowData,
+							pushRef,
+							retryOf,
+						},
+						executionId,
+					);
+
+					await testLifecycleHooks.runHook('workflowExecuteAfter', [successfulRunWithMetadata, {}]);
+
+					// Metadata should not be saved before deletion
+					expect(executionMetadataService.save).not.toHaveBeenCalled();
+					// Execution should be deleted
+					expect(executionRepository.hardDelete).toHaveBeenCalledWith({
+						workflowId,
+						executionId,
+					});
+				});
+
+				it('should NOT save metadata when execution has none', async () => {
+					await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRun, {}]);
+
+					expect(executionMetadataService.save).not.toHaveBeenCalled();
+				});
+			});
 		});
 	});
 
 	describe('getLifecycleHooksForScalingWorker', () => {
 		const createHooks = (executionMode: WorkflowExecuteMode = 'manual') =>
-			getLifecycleHooksForScalingWorker(executionMode, executionId, workflowData, {
-				pushRef,
-				retryOf,
-			});
+			getLifecycleHooksForScalingWorker(
+				{ executionMode, workflowData, pushRef, retryOf },
+				executionId,
+			);
 
 		beforeEach(() => {
 			lifecycleHooks = createHooks();
@@ -636,6 +858,7 @@ describe('Execution Lifecycle Hooks', () => {
 			expect(handlers.workflowExecuteAfter).toHaveLength(4);
 			expect(handlers.nodeFetchedData).toHaveLength(1);
 			expect(handlers.sendResponse).toHaveLength(0);
+			expect(handlers.sendChunk).toHaveLength(0);
 		});
 
 		describe('saving static data', () => {
@@ -703,6 +926,32 @@ describe('Execution Lifecycle Hooks', () => {
 				);
 			});
 		});
+
+		describe('metadata handling', () => {
+			it('should NOT save metadata in scaling worker mode', async () => {
+				const lifecycleHooks = createHooks('trigger');
+
+				await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRunWithMetadata, {}]);
+
+				// Worker should never save metadata - that's main's responsibility
+				expect(executionMetadataService.save).not.toHaveBeenCalled();
+			});
+
+			it('should still update execution data in scaling worker mode', async () => {
+				const lifecycleHooks = createHooks('trigger');
+
+				await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRunWithMetadata, {}]);
+
+				// Worker should save execution data but not metadata
+				expect(executionRepository.updateExistingExecution).toHaveBeenCalledWith(
+					executionId,
+					expect.objectContaining({
+						finished: true,
+						status: 'success',
+					}),
+				);
+			});
+		});
 	});
 
 	describe('getLifecycleHooksForSubExecutions', () => {
@@ -733,6 +982,92 @@ describe('Execution Lifecycle Hooks', () => {
 			expect(handlers.workflowExecuteAfter).toHaveLength(4);
 			expect(handlers.nodeFetchedData).toHaveLength(1);
 			expect(handlers.sendResponse).toHaveLength(0);
+			expect(handlers.sendChunk).toHaveLength(0);
+		});
+
+		describe('when parentExecution is provided', () => {
+			const parentWorkflowId = 'parent-workflow-id';
+			const parentExecutionId = 'parent-execution-id';
+			const parentExecution = {
+				workflowId: parentWorkflowId,
+				executionId: parentExecutionId,
+			};
+
+			beforeEach(() => {
+				lifecycleHooks = getLifecycleHooksForSubExecutions(
+					'integrated',
+					executionId,
+					workflowData,
+					undefined,
+					parentExecution,
+				);
+			});
+
+			it('should duplicate binary data to parent execution', async () => {
+				const binaryDataId = `filesystem:workflows/${workflowId}/executions/${executionId}/binary_data/123`;
+				const duplicatedBinaryDataId = `filesystem:workflows/${parentWorkflowId}/executions/${parentExecutionId}/binary_data/456`;
+
+				const mainOutputData = [
+					[
+						{
+							json: {},
+							binary: {
+								data: {
+									id: binaryDataId,
+									data: '',
+									mimeType: 'text/plain',
+								},
+							},
+						},
+					],
+				];
+
+				successfulRun.data.resultData.runData = {
+					[nodeName]: [
+						{
+							startTime: 1,
+							executionIndex: 0,
+							executionTime: 1,
+							source: [],
+							data: {
+								main: mainOutputData,
+							},
+						},
+					],
+				};
+				successfulRun.data.resultData.lastNodeExecuted = nodeName;
+
+				binaryDataService.duplicateBinaryData.mockResolvedValue([
+					[
+						{
+							json: {},
+							binary: {
+								data: {
+									id: duplicatedBinaryDataId,
+									data: '',
+									mimeType: 'text/plain',
+								},
+							},
+						},
+					],
+				]);
+
+				await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRun, {}]);
+
+				expect(binaryDataService.duplicateBinaryData).toHaveBeenCalledWith(
+					{ type: 'execution', workflowId: parentWorkflowId, executionId: parentExecutionId },
+					mainOutputData,
+				);
+			});
+
+			it('should not duplicate binary data when there is no output data', async () => {
+				successfulRun.data.resultData.runData = {};
+				successfulRun.data.resultData.lastNodeExecuted = undefined;
+
+				await lifecycleHooks.runHook('workflowExecuteAfter', [successfulRun, {}]);
+
+				expect(binaryDataService.duplicateBinaryData).not.toHaveBeenCalled();
+			});
 		});
 	});
 });

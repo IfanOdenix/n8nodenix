@@ -1,4 +1,4 @@
-import { NodeConnectionType, NodeOperationError } from 'n8n-workflow';
+import { NodeConnectionTypes, NodeOperationError, parseErrorMetadata } from 'n8n-workflow';
 import type {
 	ExecuteWorkflowData,
 	IExecuteFunctions,
@@ -7,9 +7,12 @@ import type {
 	INodeTypeDescription,
 } from 'n8n-workflow';
 
+import { findPairedItemThroughWorkflowData } from './../../../utils/workflow-backtracking';
 import { getWorkflowInfo } from './GenericFunctions';
 import { localResourceMapping } from './methods';
+import { generatePairedItemData } from '../../../utils/utilities';
 import { getCurrentWorkflowInputData } from '../../../utils/workflowInputsResourceMapping/GenericFunctions';
+
 export class ExecuteWorkflow implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Execute Sub-workflow',
@@ -17,15 +20,15 @@ export class ExecuteWorkflow implements INodeType {
 		icon: 'fa:sign-in-alt',
 		iconColor: 'orange-red',
 		group: ['transform'],
-		version: [1, 1.1, 1.2],
+		version: [1, 1.1, 1.2, 1.3],
 		subtitle: '={{"Workflow: " + $parameter["workflowId"]}}',
 		description: 'Execute another workflow',
 		defaults: {
 			name: 'Execute Workflow',
 			color: '#ff6d5a',
 		},
-		inputs: [NodeConnectionType.Main],
-		outputs: [NodeConnectionType.Main],
+		inputs: [NodeConnectionTypes.Main],
+		outputs: [NodeConnectionTypes.Main],
 		properties: [
 			{
 				displayName: 'Operation',
@@ -314,7 +317,9 @@ export class ExecuteWorkflow implements INodeType {
 								parentExecution: {
 									executionId: workflowProxy.$execution.id,
 									workflowId: workflowProxy.$workflow.id,
+									shouldResume: waitForSubWorkflow,
 								},
+								executionMode: this.getMode(),
 							},
 						);
 						const workflowResult = executionResult.data as INodeExecutionData[][];
@@ -346,7 +351,9 @@ export class ExecuteWorkflow implements INodeType {
 								parentExecution: {
 									executionId: workflowProxy.$execution.id,
 									workflowId: workflowProxy.$workflow.id,
+									shouldResume: waitForSubWorkflow,
 								},
+								executionMode: this.getMode(),
 							},
 						);
 
@@ -366,10 +373,20 @@ export class ExecuteWorkflow implements INodeType {
 					}
 				} catch (error) {
 					if (this.continueOnFail()) {
-						if (returnData[i] === undefined) {
-							returnData[i] = [];
-						}
-						returnData[i].push({ json: { error: error.message }, pairedItem: { item: i } });
+						const nodeVersion = this.getNode().typeVersion;
+						// In versions < 1.3 using the "Continue (using error output)" mode
+						// the node would return items in extra "error branches" instead of
+						// returning an array of items on the error output. These branches weren't really shown correctly on the UI.
+						// In the fixed >= 1.3 versions the errors are now all output into the single error output as an array of error items.
+						const outputIndex = nodeVersion >= 1.3 ? 0 : i;
+
+						returnData[outputIndex] ??= [];
+						const metadata = parseErrorMetadata(error);
+						returnData[outputIndex].push({
+							json: { error: error.message },
+							pairedItem: { item: i },
+							metadata,
+						});
 						continue;
 					}
 					throw new NodeOperationError(this.getNode(), error, {
@@ -403,7 +420,9 @@ export class ExecuteWorkflow implements INodeType {
 						parentExecution: {
 							executionId: workflowProxy.$execution.id,
 							workflowId: workflowProxy.$workflow.id,
+							shouldResume: waitForSubWorkflow,
 						},
+						executionMode: this.getMode(),
 					},
 				);
 
@@ -419,24 +438,53 @@ export class ExecuteWorkflow implements INodeType {
 					return [items];
 				}
 
+				const workflowRunData = await this.getExecutionDataById(executionResult.executionId);
+
 				const workflowResult = executionResult.data as INodeExecutionData[][];
+
+				const fallbackPairedItemData = generatePairedItemData(items.length);
 
 				for (const output of workflowResult) {
 					const sameLength = output.length === items.length;
 
 					for (const [itemIndex, item] of output.entries()) {
-						if (item.pairedItem) continue;
+						if (item.pairedItem) {
+							// If the item already has a paired item, we need to follow these to the start of the child workflow
+							if (workflowRunData !== undefined) {
+								const pairedItem = findPairedItemThroughWorkflowData(
+									workflowRunData,
+									item,
+									itemIndex,
+								);
+								if (pairedItem !== undefined) {
+									item.pairedItem = pairedItem;
+								}
+							}
+							continue;
+						}
 
 						if (sameLength) {
 							item.pairedItem = { item: itemIndex };
+						} else {
+							item.pairedItem = fallbackPairedItemData;
 						}
 					}
 				}
 
 				return workflowResult;
 			} catch (error) {
+				const pairedItem = generatePairedItemData(items.length);
 				if (this.continueOnFail()) {
-					return [[{ json: { error: error.message } }]];
+					const metadata = parseErrorMetadata(error);
+					return [
+						[
+							{
+								json: { error: error.message },
+								metadata,
+								pairedItem,
+							},
+						],
+					];
 				}
 				throw error;
 			}
